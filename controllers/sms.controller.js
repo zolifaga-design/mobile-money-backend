@@ -67,6 +67,14 @@ exports.sendSms = [
                 smsHash
             });
 
+            if (result?.processing) {
+                return res.status(409).json({
+                    success: false,
+                    processing: true,
+                    error: "SMS déjà en cours de traitement"
+                });
+            }
+
             return res.json({
                 success: true,
                 ...result

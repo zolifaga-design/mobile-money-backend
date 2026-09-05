@@ -246,8 +246,19 @@ async function appendRawRows(refreshToken, spreadsheetId, rows) {
     return true;
 }
 
+async function rawHashExists(refreshToken, spreadsheetId, smsHash) {
+    const sheets = await getSheetsClient(refreshToken);
+    const response = await sheets.spreadsheets.values.get({
+        spreadsheetId,
+        range: "Transactions brutes!E:E",
+        valueRenderOption: "UNFORMATTED_VALUE"
+    });
+    return (response.data.values || []).some(row => String(row[0] || "").trim() === smsHash);
+}
+
 module.exports = {
     appendRawRows,
+    rawHashExists,
     readRawMessages,
     appendRows,
     updateStatus,
