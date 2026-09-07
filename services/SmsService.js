@@ -1,3 +1,4 @@
+const crypto = require("crypto");
 const sequelize = require("../database/database");
 const UserSettings = require("../models/UserSettings");
 const DailySheet = require("../models/DailySheet");
@@ -9,6 +10,23 @@ const { processDailySheet } = require("./dailySheetProcessorService");
 
 const PROCESSING_STALE_MS = 5 * 60 * 1000;
 const processingTimers = new Map();
+
+function generateSmsHash(sender, message, receivedAt) {
+    const normalizedSender = String(sender ?? "").trim();
+    const normalizedMessage = String(message ?? "").trim();
+    const normalizedTimestamp = Math.max(
+        0,
+        Math.trunc(Number(receivedAt) || 0)
+    );
+
+    return crypto
+        .createHash("sha256")
+        .update(
+            `${normalizedSender}|${normalizedMessage}|${normalizedTimestamp}`,
+            "utf8"
+        )
+        .digest("hex");
+}
 
 function scheduleProcessing(refreshToken, spreadsheetId) {
     const previous = processingTimers.get(spreadsheetId);
@@ -160,6 +178,24 @@ async function send({ userId, sender, message, receivedAt, smsHash }) {
         Number.isFinite(timestamp) && timestamp > 0
             ? Math.trunc(timestamp)
             : Date.now();
+
+    const expectedHash = generateSmsHash(
+        normalizedSender,
+        normalizedMessage,
+        safeTimestamp
+    );
+
+    if (normalizedHash !== expectedHash) {
+        const error = new Error("smsHash invalide");
+        error.statusCode = 422;
+
+        console.warn("⚠️ SMS rejeté — smsHash invalide", {
+            userId,
+            smsHash: normalizedHash
+        });
+
+        throw error;
+    }
 
     const settings = await UserSettings.findOne({ where: { userId } });
     if (!settings) throw new Error("Paramètres utilisateur introuvables");

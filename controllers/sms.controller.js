@@ -81,7 +81,13 @@ exports.sendSms = [
             });
         } catch (err) {
             console.error("❌ Erreur envoi SMS:", err);
-            return res.status(500).json({
+
+            const statusCode =
+                Number.isInteger(err?.statusCode)
+                    ? err.statusCode
+                    : 500;
+
+            return res.status(statusCode).json({
                 success: false,
                 error: err.message || "Erreur serveur"
             });
