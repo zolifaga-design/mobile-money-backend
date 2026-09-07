@@ -53,6 +53,67 @@ async function addColumnIfMissing(
     );
 }
 
+async function ensureAllModelColumns(sequelize) {
+    console.log("🔍 Vérification automatique des colonnes des modèles...");
+
+    const models = Object.values(sequelize.models || {});
+    const queryInterface = sequelize.getQueryInterface();
+
+    for (const model of models) {
+        const tableName = model.getTableName();
+        const physicalTable = typeof tableName === "string" ? tableName : tableName.tableName;
+
+        if (!physicalTable) continue;
+
+        let existingColumns;
+        try {
+            existingColumns = await queryInterface.describeTable(physicalTable);
+        } catch (error) {
+            // sequelize.sync() doit normalement avoir créé la table.
+            // On ne bloque pas le démarrage si une table n'existe pas encore.
+            console.warn(`⚠️ Impossible de décrire ${physicalTable}: ${error.message}`);
+            continue;
+        }
+
+        for (const [attributeName, attribute] of Object.entries(model.rawAttributes)) {
+            const fieldName = attribute.field || attributeName;
+            if (existingColumns[fieldName]) continue;
+
+            // Pour une base déjà remplie, une nouvelle colonne NOT NULL sans
+            // valeur par défaut ferait échouer le redémarrage. On l'ajoute donc
+            // d'abord nullable; les nouvelles lignes utiliseront ensuite les
+            // règles du modèle Sequelize.
+            const definition = {
+                type: attribute.type,
+                allowNull: true
+            };
+
+            if (attribute.defaultValue !== undefined) {
+                definition.defaultValue = attribute.defaultValue;
+            }
+
+            try {
+                await queryInterface.addColumn(
+                    physicalTable,
+                    fieldName,
+                    definition
+                );
+                console.log(`✅ Colonne auto-ajoutée: ${physicalTable}.${fieldName}`);
+            } catch (error) {
+                // Deux instances peuvent démarrer simultanément. Une autre
+                // instance peut avoir créé la colonne entre describeTable et
+                // addColumn; on vérifie alors à nouveau avant d'échouer.
+                const refreshed = await queryInterface.describeTable(physicalTable);
+                if (refreshed[fieldName]) {
+                    console.log(`✓ ${physicalTable}.${fieldName} existe déjà`);
+                } else {
+                    throw error;
+                }
+            }
+        }
+    }
+}
+
 async function finalizeTrackzoSchema(sequelize) {
 
     console.log(
