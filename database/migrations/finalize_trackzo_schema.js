@@ -1,323 +1,198 @@
 const { QueryTypes } = require("sequelize");
 
-async function columnExists(sequelize, tableName, columnName) {
-    const result = await sequelize.query(
-        `
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = :tableName
-          AND column_name = :columnName
-        LIMIT 1
-        `,
+async function tableExists(sequelize, tableName) {
+    const rows = await sequelize.query(
+        `SELECT 1
+         FROM information_schema.tables
+         WHERE table_schema = 'public'
+           AND table_name = :tableName
+         LIMIT 1`,
         {
-            replacements: {
-                tableName,
-                columnName
-            },
+            replacements: { tableName },
             type: QueryTypes.SELECT
         }
     );
-
-    return result.length > 0;
+    return rows.length > 0;
 }
 
-async function addColumnIfMissing(
-    sequelize,
-    tableName,
-    columnName,
-    definition
-) {
-    const exists = await columnExists(
-        sequelize,
-        tableName,
-        columnName
+async function columnExists(sequelize, tableName, columnName) {
+    const rows = await sequelize.query(
+        `SELECT 1
+         FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = :tableName
+           AND column_name = :columnName
+         LIMIT 1`,
+        {
+            replacements: { tableName, columnName },
+            type: QueryTypes.SELECT
+        }
     );
+    return rows.length > 0;
+}
 
-    if (exists) {
-        console.log(
-            `✓ ${tableName}.${columnName} existe déjà`
-        );
+async function addColumnIfMissing(sequelize, tableName, columnName, definition) {
+    if (!(await tableExists(sequelize, tableName))) return;
+
+    if (await columnExists(sequelize, tableName, columnName)) {
+        console.log(`✓ ${tableName}.${columnName} existe déjà`);
         return;
     }
 
     await sequelize.query(
-        `
-        ALTER TABLE "${tableName}"
-        ADD COLUMN "${columnName}" ${definition}
-        `
+        `ALTER TABLE "${tableName}" ADD COLUMN "${columnName}" ${definition}`
     );
-
-    console.log(
-        `✅ Colonne ajoutée: ${tableName}.${columnName}`
-    );
+    console.log(`✅ Colonne ajoutée: ${tableName}.${columnName}`);
 }
 
-async function ensureAllModelColumns(sequelize) {
-    console.log("🔍 Vérification automatique des colonnes des modèles...");
-
-    const models = Object.values(sequelize.models || {});
-    const queryInterface = sequelize.getQueryInterface();
-
-    for (const model of models) {
-        const tableName = model.getTableName();
-        const physicalTable = typeof tableName === "string" ? tableName : tableName.tableName;
-
-        if (!physicalTable) continue;
-
-        let existingColumns;
-        try {
-            existingColumns = await queryInterface.describeTable(physicalTable);
-        } catch (error) {
-            // sequelize.sync() doit normalement avoir créé la table.
-            // On ne bloque pas le démarrage si une table n'existe pas encore.
-            console.warn(`⚠️ Impossible de décrire ${physicalTable}: ${error.message}`);
-            continue;
-        }
-
-        for (const [attributeName, attribute] of Object.entries(model.rawAttributes)) {
-            const fieldName = attribute.field || attributeName;
-            if (existingColumns[fieldName]) continue;
-
-            // Pour une base déjà remplie, une nouvelle colonne NOT NULL sans
-            // valeur par défaut ferait échouer le redémarrage. On l'ajoute donc
-            // d'abord nullable; les nouvelles lignes utiliseront ensuite les
-            // règles du modèle Sequelize.
-            const definition = {
-                type: attribute.type,
-                allowNull: true
-            };
-
-            if (attribute.defaultValue !== undefined) {
-                definition.defaultValue = attribute.defaultValue;
-            }
-
-            try {
-                await queryInterface.addColumn(
-                    physicalTable,
-                    fieldName,
-                    definition
-                );
-                console.log(`✅ Colonne auto-ajoutée: ${physicalTable}.${fieldName}`);
-            } catch (error) {
-                // Deux instances peuvent démarrer simultanément. Une autre
-                // instance peut avoir créé la colonne entre describeTable et
-                // addColumn; on vérifie alors à nouveau avant d'échouer.
-                const refreshed = await queryInterface.describeTable(physicalTable);
-                if (refreshed[fieldName]) {
-                    console.log(`✓ ${physicalTable}.${fieldName} existe déjà`);
-                } else {
-                    throw error;
-                }
-            }
-        }
+async function ensureSmsReceiptSchema(sequelize) {
+    if (!(await tableExists(sequelize, "sms_receipts"))) {
+        // sequelize.sync() est censé créer la table. On ne fabrique pas ici
+        // une table concurrente avec une définition différente.
+        return;
     }
+
+    // Le modèle Sequelize attend ces colonnes. status était la cause du
+    // SequelizeDatabaseError observé en production.
+    await addColumnIfMissing(
+        sequelize, "sms_receipts", "userId", `UUID`
+    );
+    await addColumnIfMissing(
+        sequelize, "sms_receipts", "smsHash", `VARCHAR(64)`
+    );
+    await addColumnIfMissing(
+        sequelize, "sms_receipts", "sender", `VARCHAR(255)`
+    );
+    await addColumnIfMissing(
+        sequelize, "sms_receipts", "message", `TEXT`
+    );
+    await addColumnIfMissing(
+        sequelize, "sms_receipts", "receivedAt", `BIGINT`
+    );
+    await addColumnIfMissing(
+        sequelize, "sms_receipts", "status",
+        `VARCHAR(20) NOT NULL DEFAULT 'PROCESSING'`
+    );
+    await addColumnIfMissing(
+        sequelize, "sms_receipts", "createdAt",
+        `TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP`
+    );
+    await addColumnIfMissing(
+        sequelize, "sms_receipts", "updatedAt",
+        `TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP`
+    );
+
+    // Nettoyage des éventuels doublons historiques avant de poser l'unicité.
+    // On conserve en priorité COMPLETED, puis la ligne la plus ancienne.
+    await sequelize.query(`
+        WITH ranked AS (
+            SELECT
+                ctid,
+                ROW_NUMBER() OVER (
+                    PARTITION BY "smsHash"
+                    ORDER BY
+                        CASE WHEN "status" = 'COMPLETED' THEN 0 ELSE 1 END,
+                        "createdAt" ASC,
+                        ctid ASC
+                ) AS rn
+            FROM "sms_receipts"
+            WHERE "smsHash" IS NOT NULL
+        )
+        DELETE FROM "sms_receipts" s
+        USING ranked r
+        WHERE s.ctid = r.ctid
+          AND r.rn > 1
+    `);
+
+    // Une seule réception logique par hash. L'index est idempotent.
+    await sequelize.query(`
+        CREATE UNIQUE INDEX IF NOT EXISTS sms_receipts_sms_hash_unique
+        ON "sms_receipts" ("smsHash")
+        WHERE "smsHash" IS NOT NULL
+    `);
+
+    await sequelize.query(`
+        CREATE INDEX IF NOT EXISTS sms_receipts_user_id_idx
+        ON "sms_receipts" ("userId")
+    `);
+
+    await sequelize.query(`
+        CREATE INDEX IF NOT EXISTS sms_receipts_status_idx
+        ON "sms_receipts" ("status")
+    `);
 }
 
 async function finalizeTrackzoSchema(sequelize) {
+    console.log("🔧 Vérification du schéma Trackzo...");
 
-    console.log(
-        "🔧 Vérification du schéma Trackzo..."
-    );
+    // ==========================
+    // DEVICES
+    // ==========================
+    await addColumnIfMissing(sequelize, "devices", "authTokenHash", `VARCHAR(64)`);
+    if (await tableExists(sequelize, "devices")) {
+        await sequelize.query(`
+            CREATE UNIQUE INDEX IF NOT EXISTS devices_auth_token_hash_unique
+            ON "devices" ("authTokenHash")
+            WHERE "authTokenHash" IS NOT NULL
+        `);
+    }
 
-    // ==========================================
-    // DEVICES / AUTHENTIFICATION
-    // ==========================================
-
-    await addColumnIfMissing(
-        sequelize,
-        "devices",
-        "authTokenHash",
-        `VARCHAR(64)`
-    );
-
-
-    await sequelize.query(`
-        CREATE UNIQUE INDEX IF NOT EXISTS devices_auth_token_hash_unique
-        ON "devices" ("authTokenHash")
-        WHERE "authTokenHash" IS NOT NULL
-    `);
-
-    // ==========================================
+    // ==========================
     // USER SETTINGS
-    // ==========================================
+    // ==========================
+    const userSettingsColumns = [
+        ["country", `VARCHAR(255) DEFAULT 'CI'`],
+        ["openingTime", `VARCHAR(255) DEFAULT '08:00'`],
+        ["closingTime", `VARCHAR(255) DEFAULT '22:00'`],
+        ["dailySheetCreation", `VARCHAR(255) DEFAULT '00:05'`],
+        ["timezone", `VARCHAR(255) DEFAULT 'Africa/Abidjan'`],
+        ["scriptId", `VARCHAR(255)`],
+        ["agentToken", `TEXT`],
+        ["sheetId", `VARCHAR(255)`],
+        ["sheetUrl", `TEXT`],
+        ["sheetName", `VARCHAR(255)`],
+        ["sheetCreated", `BOOLEAN DEFAULT FALSE`],
+        ["lastTemplateVersion", `VARCHAR(255) DEFAULT '1.0'`],
+        ["templateId", `UUID`]
+    ];
+    for (const [name, definition] of userSettingsColumns) {
+        await addColumnIfMissing(sequelize, "user_settings", name, definition);
+    }
 
-    await addColumnIfMissing(
-        sequelize,
-        "user_settings",
-        "country",
-        `VARCHAR(255) DEFAULT 'CI'`
-    );
-
-    await addColumnIfMissing(
-        sequelize,
-        "user_settings",
-        "openingTime",
-        `VARCHAR(255) DEFAULT '08:00'`
-    );
-
-    await addColumnIfMissing(
-        sequelize,
-        "user_settings",
-        "closingTime",
-        `VARCHAR(255) DEFAULT '22:00'`
-    );
-
-    await addColumnIfMissing(
-        sequelize,
-        "user_settings",
-        "dailySheetCreation",
-        `VARCHAR(255) DEFAULT '00:05'`
-    );
-
-    await addColumnIfMissing(
-        sequelize,
-        "user_settings",
-        "timezone",
-        `VARCHAR(255) DEFAULT 'Africa/Abidjan'`
-    );
-
-    await addColumnIfMissing(
-        sequelize,
-        "user_settings",
-        "scriptId",
-        `VARCHAR(255)`
-    );
-
-    await addColumnIfMissing(
-        sequelize,
-        "user_settings",
-        "agentToken",
-        `TEXT`
-    );
-
-    await addColumnIfMissing(
-        sequelize,
-        "user_settings",
-        "sheetId",
-        `VARCHAR(255)`
-    );
-
-    await addColumnIfMissing(
-        sequelize,
-        "user_settings",
-        "sheetUrl",
-        `TEXT`
-    );
-
-    await addColumnIfMissing(
-        sequelize,
-        "user_settings",
-        "sheetName",
-        `VARCHAR(255)`
-    );
-
-    await addColumnIfMissing(
-        sequelize,
-        "user_settings",
-        "sheetCreated",
-        `BOOLEAN DEFAULT FALSE`
-    );
-
-    await addColumnIfMissing(
-        sequelize,
-        "user_settings",
-        "lastTemplateVersion",
-        `VARCHAR(255) DEFAULT '1.0'`
-    );
-
-    await addColumnIfMissing(
-        sequelize,
-        "user_settings",
-        "templateId",
-        `UUID`
-    );
-
-
-    // ==========================================
+    // ==========================
     // SMS RECEIPTS
-    // ==========================================
+    // ==========================
+    await ensureSmsReceiptSchema(sequelize);
 
-    await addColumnIfMissing(
-        sequelize,
-        "sms_receipts",
-        "message",
-        `TEXT`
-    );
-
-
-    // ==========================================
+    // ==========================
     // DAILY SHEETS
-    // ==========================================
+    // ==========================
+    await addColumnIfMissing(sequelize, "daily_sheets", "url", `TEXT`);
+    await addColumnIfMissing(sequelize, "daily_sheets", "scriptId", `VARCHAR(255)`);
 
-    await addColumnIfMissing(
-        sequelize,
-        "daily_sheets",
-        "url",
-        `TEXT`
-    );
+    if (await tableExists(sequelize, "daily_sheets")) {
+        await sequelize.query(`
+            CREATE UNIQUE INDEX IF NOT EXISTS daily_sheets_user_date_unique
+            ON "daily_sheets" ("userId", "date")
+        `);
+    }
 
-    await addColumnIfMissing(
-        sequelize,
-        "daily_sheets",
-        "scriptId",
-        `VARCHAR(255)`
-    );
-
-
-    // ==========================================
+    // ==========================
     // GOOGLE ACCOUNTS
-    // ==========================================
+    // ==========================
+    const googleColumns = [
+        ["accessToken", `TEXT`],
+        ["expiryDate", `BIGINT`],
+        ["expiresAt", `TIMESTAMP WITH TIME ZONE`],
+        ["trackzoFolderId", `VARCHAR(255)`],
+        ["dailyFolderId", `VARCHAR(255)`],
+        ["reportsFolderId", `VARCHAR(255)`]
+    ];
+    for (const [name, definition] of googleColumns) {
+        await addColumnIfMissing(sequelize, "google_accounts", name, definition);
+    }
 
-    await addColumnIfMissing(
-        sequelize,
-        "google_accounts",
-        "accessToken",
-        `TEXT`
-    );
-
-    await addColumnIfMissing(
-        sequelize,
-        "google_accounts",
-        "expiryDate",
-        `BIGINT`
-    );
-
-    await addColumnIfMissing(
-        sequelize,
-        "google_accounts",
-        "expiresAt",
-        `TIMESTAMP WITH TIME ZONE`
-    );
-
-    await addColumnIfMissing(
-        sequelize,
-        "google_accounts",
-        "trackzoFolderId",
-        `VARCHAR(255)`
-    );
-
-    await addColumnIfMissing(
-        sequelize,
-        "google_accounts",
-        "dailyFolderId",
-        `VARCHAR(255)`
-    );
-
-    await addColumnIfMissing(
-        sequelize,
-        "google_accounts",
-        "reportsFolderId",
-        `VARCHAR(255)`
-    );
-
-
-    console.log(
-        "✅ Schéma Trackzo finalisé"
-    );
+    console.log("✅ Schéma Trackzo finalisé");
 }
 
-
-module.exports = {
-    finalizeTrackzoSchema
-};
+module.exports = { finalizeTrackzoSchema };

@@ -1,3 +1,4 @@
+const sequelize = require("../database/database");
 const UserSettings = require("../models/UserSettings");
 const DailySheet = require("../models/DailySheet");
 const GoogleAccount = require("../models/GoogleAccount");
@@ -18,8 +19,11 @@ function scheduleProcessing(refreshToken, spreadsheetId) {
         try {
             const result = await processDailySheet(refreshToken, spreadsheetId);
             console.log("⚙️ Traitement feuille automatique terminé:", {
-                spreadsheetId, processed: result.processed, cleaned: result.cleaned,
-                alerts: result.alerts, errors: result.errors
+                spreadsheetId,
+                processed: result.processed,
+                cleaned: result.cleaned,
+                alerts: result.alerts,
+                errors: result.errors
             });
         } catch (error) {
             console.error("⚠️ Traitement feuille différé:", error.message);
@@ -29,84 +33,247 @@ function scheduleProcessing(refreshToken, spreadsheetId) {
     processingTimers.set(spreadsheetId, timer);
 }
 
+async function withAdvisoryLock(transaction, key, fn) {
+    await sequelize.query(
+        `SELECT pg_advisory_xact_lock(hashtext(:lockKey))`,
+        {
+            replacements: { lockKey: key },
+            transaction
+        }
+    );
+    return fn();
+}
+
+/**
+ * Claim atomique:
+ * - COMPLETED => le SMS est déjà accepté, aucune écriture Sheet.
+ * - PROCESSING récent => une autre tentative travaille dessus.
+ * - PROCESSING ancien => on reprend après réconciliation avec Google.
+ * - absent => on réserve le hash avant l'appel Google.
+ *
+ * Le hash unique PostgreSQL reste la deuxième barrière contre les courses.
+ */
+async function claimReceipt({ userId, sender, message, receivedAt, smsHash }) {
+    return sequelize.transaction(async transaction => {
+        return withAdvisoryLock(
+            transaction,
+            `trackzo:sms:${smsHash}`,
+            async () => {
+                let receipt = await SmsReceipt.findOne({
+                    where: { smsHash },
+                    transaction,
+                    lock: transaction.LOCK.UPDATE
+                });
+
+                if (receipt?.status === "COMPLETED") {
+                    return { state: "COMPLETED" };
+                }
+
+                if (receipt?.status === "PROCESSING") {
+                    const updatedAt = receipt.updatedAt
+                        ? new Date(receipt.updatedAt).getTime()
+                        : 0;
+
+                    if (Date.now() - updatedAt < PROCESSING_STALE_MS) {
+                        return { state: "PROCESSING" };
+                    }
+
+                    // Le worker précédent est considéré abandonné.
+                    await receipt.update({
+                        userId,
+                        sender,
+                        message,
+                        receivedAt,
+                        status: "PROCESSING"
+                    }, { transaction });
+
+                    return { state: "RETRY", receiptId: receipt.id };
+                }
+
+                if (!receipt) {
+                    try {
+                        receipt = await SmsReceipt.create({
+                            userId,
+                            smsHash,
+                            sender,
+                            message,
+                            receivedAt,
+                            status: "PROCESSING"
+                        }, { transaction });
+                    } catch (error) {
+                        if (error.name === "SequelizeUniqueConstraintError") {
+                            // Une autre instance a gagné la course.
+                            return { state: "PROCESSING" };
+                        }
+                        throw error;
+                    }
+                } else {
+                    await receipt.update({
+                        userId,
+                        sender,
+                        message,
+                        receivedAt,
+                        status: "PROCESSING"
+                    }, { transaction });
+                }
+
+                return { state: "CLAIMED", receiptId: receipt.id };
+            }
+        );
+    });
+}
+
+async function markCompleted(smsHash) {
+    return sequelize.transaction(async transaction => {
+        return withAdvisoryLock(
+            transaction,
+            `trackzo:sms:${smsHash}`,
+            async () => {
+                const receipt = await SmsReceipt.findOne({
+                    where: { smsHash },
+                    transaction,
+                    lock: transaction.LOCK.UPDATE
+                });
+
+                if (!receipt) {
+                    throw new Error("Receipt SMS introuvable après écriture Google");
+                }
+
+                await receipt.update({ status: "COMPLETED" }, { transaction });
+                return receipt;
+            }
+        );
+    });
+}
+
 async function send({ userId, sender, message, receivedAt, smsHash }) {
     const normalizedSender = String(sender ?? "").trim();
     const normalizedMessage = String(message ?? "").trim();
     const normalizedHash = String(smsHash ?? "").trim();
+
     if (!userId || !normalizedSender || !normalizedMessage || !normalizedHash) {
         throw new Error("Données SMS incomplètes");
     }
 
-    let receipt = await SmsReceipt.findOne({ where: { smsHash: normalizedHash } });
-    if (receipt?.status === "COMPLETED") return { duplicate: true };
+    const timestamp = Number(receivedAt);
+    const safeTimestamp =
+        Number.isFinite(timestamp) && timestamp > 0
+            ? Math.trunc(timestamp)
+            : Date.now();
 
     const settings = await UserSettings.findOne({ where: { userId } });
     if (!settings) throw new Error("Paramètres utilisateur introuvables");
+
     const googleAccount = await GoogleAccount.findOne({ where: { userId } });
-    if (!googleAccount?.refreshToken) throw new Error("Compte Google non connecté");
+    if (!googleAccount?.refreshToken) {
+        throw new Error("Compte Google non connecté");
+    }
 
     const timezone = settings.timezone || "Africa/Abidjan";
     const date = getLocalDate(timezone);
+
     let dailySheet = await DailySheet.findOne({ where: { userId, date } });
-    if (!dailySheet) dailySheet = await createDailySheet(userId);
 
-    // Un retry après timeout doit d'abord vérifier si Google avait déjà accepté
-    // l'append. Le hash technique en colonne E rend cette vérification idempotente.
-    if (receipt?.status === "PROCESSING") {
-        const alreadyInSheet = await rawHashExists(
-            googleAccount.refreshToken, dailySheet.spreadsheetId, normalizedHash
-        );
-        if (alreadyInSheet) {
-            await receipt.update({ status: "COMPLETED" });
-            scheduleProcessing(googleAccount.refreshToken, dailySheet.spreadsheetId);
-            return { duplicate: true, reconciled: true, spreadsheetId: dailySheet.spreadsheetId };
-        }
+    if (!dailySheet) {
+        // Protection DB contre deux créations du journalier du même jour.
+        await sequelize.transaction(async transaction => {
+            await sequelize.query(
+                `SELECT pg_advisory_xact_lock(hashtext(:lockKey))`,
+                {
+                    replacements: {
+                        lockKey: `trackzo:daily-sheet:${userId}:${date}`
+                    },
+                    transaction
+                }
+            );
 
-        const updatedAt = receipt.updatedAt ? new Date(receipt.updatedAt).getTime() : 0;
-        if (Date.now() - updatedAt < PROCESSING_STALE_MS) {
-            return { processing: true };
-        }
-        console.warn("⚠️ Receipt PROCESSING ancien, reprise autorisée", normalizedHash);
-    }
-
-    if (!receipt) {
-        try {
-            receipt = await SmsReceipt.create({
-                userId, smsHash: normalizedHash, sender: normalizedSender,
-                message: normalizedMessage, receivedAt, status: "PROCESSING"
+            const current = await DailySheet.findOne({
+                where: { userId, date }
             });
-        } catch (error) {
-            if (error.name === "SequelizeUniqueConstraintError") {
-                receipt = await SmsReceipt.findOne({ where: { smsHash: normalizedHash } });
-                if (receipt?.status === "COMPLETED") return { duplicate: true };
-                return { processing: true };
+
+            if (!current) {
+                await createDailySheet(userId);
             }
-            throw error;
-        }
-    } else if (receipt.status !== "PROCESSING") {
-        await receipt.update({ status: "PROCESSING" });
+        });
+
+        dailySheet = await DailySheet.findOne({ where: { userId, date } });
     }
 
-    const timestamp = Number(receivedAt);
-    const safeDate = Number.isFinite(timestamp) && timestamp > 0 ? new Date(timestamp) : new Date();
-    const time = new Intl.DateTimeFormat("fr-FR", {
-        timeZone: timezone, hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false
-    }).format(safeDate);
+    if (!dailySheet) {
+        throw new Error("Journalier introuvable après création");
+    }
 
-    // A:D restent compatibles avec le modèle actuel. E stocke le hash uniquement
-    // pour l'idempotence technique et n'est pas utilisé par le processor.
-    await appendRawRows(
+    const claim = await claimReceipt({
+        userId,
+        sender: normalizedSender,
+        message: normalizedMessage,
+        receivedAt: safeTimestamp,
+        smsHash: normalizedHash
+    });
+
+    if (claim.state === "COMPLETED") {
+        return { duplicate: true, accepted: true, spreadsheetId: dailySheet.spreadsheetId };
+    }
+
+    if (claim.state === "PROCESSING") {
+        return { processing: true };
+    }
+
+    // Pour un nouveau claim ou une reprise ancienne, Google est la source de
+    // vérité en cas de timeout/connexion coupée après append.
+    const alreadyInSheet = await rawHashExists(
         googleAccount.refreshToken,
         dailySheet.spreadsheetId,
-        [[date, time, normalizedMessage, "PENDING", normalizedHash]]
+        normalizedHash
     );
 
-    // ACK serveur : à partir de cet instant, le SMS peut sortir de Room.
-    await receipt.update({ status: "COMPLETED" });
+    if (alreadyInSheet) {
+        await markCompleted(normalizedHash);
+        scheduleProcessing(googleAccount.refreshToken, dailySheet.spreadsheetId);
+        return {
+            duplicate: true,
+            reconciled: true,
+            spreadsheetId: dailySheet.spreadsheetId
+        };
+    }
 
-    // Traitement regroupé par feuille : plusieurs SMS rapprochés déclenchent une
-    // seule exécution après 2 secondes, au lieu d'une exécution Google par SMS.
-    scheduleProcessing(googleAccount.refreshToken, dailySheet.spreadsheetId);
+    const safeDate = new Date(safeTimestamp);
+    const time = new Intl.DateTimeFormat("fr-FR", {
+        timeZone: timezone,
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false
+    }).format(safeDate);
+
+    try {
+        await appendRawRows(
+            googleAccount.refreshToken,
+            dailySheet.spreadsheetId,
+            [[
+                date,
+                time,
+                normalizedMessage,
+                "PENDING",
+                normalizedHash
+            ]]
+        );
+    } catch (error) {
+        // IMPORTANT: on conserve PROCESSING en DB.
+        // Une prochaine tentative réconciliera E:E avant tout nouvel append.
+        console.error("⚠️ Append Google incertain — receipt conservé PROCESSING", {
+            smsHash: normalizedHash,
+            error: error.message
+        });
+        throw error;
+    }
+
+    await markCompleted(normalizedHash);
+
+    scheduleProcessing(
+        googleAccount.refreshToken,
+        dailySheet.spreadsheetId
+    );
 
     return {
         duplicate: false,
